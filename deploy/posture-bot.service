@@ -1,0 +1,18 @@
+# Linux: copy repo to /opt/posture-bot, then
+#   sudo cp deploy/posture-bot.service /etc/systemd/system/ && sudo systemctl enable --now posture-bot
+[Unit]
+Description=Posture reminder Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/opt/posture-bot
+ExecStart=/opt/posture-bot/run.sh
+Restart=always
+RestartSec=5
+DynamicUser=yes
+StateDirectory=posture-bot
+Environment=DB_PATH=/var/lib/posture-bot/bot.sqlite3
+
+[Install]
+WantedBy=multi-user.target

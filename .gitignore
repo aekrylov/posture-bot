@@ -1,0 +1,7 @@
+.env
+bot.sqlite3*
+*.log
+__pycache__/
+.venv/
+.aws-sam/
+.DS_Store
