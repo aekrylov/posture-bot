@@ -9,7 +9,10 @@ Three handlers share this module:
              hourly slots. A slot too close to schedule at its own minute (only
              right after first deploy) is scheduled SCHEDULE_MARGIN s from now
              instead. Past slots are never re-sent.
-             Also handles {"set_webhook": url} so the token never leaves AWS.
+             Every run also makes sure Telegram's webhook points at WEBHOOK_URL
+             (so storing/rotating the token needs no redeploy), and the planner
+             doubles as a CloudFormation custom resource: `sam deploy` alone
+             schedules slots and registers the webhook; stack delete removes it.
   broadcast  Invoked by a one-time schedule at the minute of the slot; sleeps to
              the exact random second, then sends the photo to every active user.
 
@@ -69,6 +72,8 @@ DISPLAY_TZ = ZoneInfo(E.get("DISPLAY_TZ", "Europe/Berlin"))
 ALLOWED_CHANNELS = {c.strip().lower() for c in E.get("ALLOWED_CHANNELS", "").split(",") if c.strip()}
 PHOTO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "photo.jpg")
 DAY = 86400
+WEBHOOK_URL = E.get("WEBHOOK_URL", "")  # set on the planner only (avoids a template cycle)
+ALLOWED_UPDATES = ["message", "my_chat_member"]
 
 ddb = boto3.resource("dynamodb")
 users = ddb.Table(USERS_TABLE)
@@ -333,17 +338,89 @@ def _invoke_continuation(slot: int) -> None:
                    Payload=json.dumps({"slot": slot, "continuation": True}).encode())
 
 
+def ensure_webhook(force: bool = False) -> str:
+    """Point Telegram's webhook at WEBHOOK_URL. Never raises: returns a status."""
+    if not WEBHOOK_URL:
+        return "no WEBHOOK_URL"
+    try:
+        token()
+    except ssm.exceptions.ParameterNotFound:
+        log.warning("token %s not stored yet; webhook not registered", TOKEN_PARAM)
+        return "token missing"
+    try:
+        if not force:
+            info = api("getWebhookInfo")
+            if (info.get("url") == WEBHOOK_URL
+                    and sorted(info.get("allowed_updates") or []) == sorted(ALLOWED_UPDATES)
+                    and "403" not in (info.get("last_error_message") or "")):  # 403 = stale secret (token rotated)
+                return "ok"
+        api("setWebhook", {"url": WEBHOOK_URL, "secret_token": webhook_secret(),
+                           "allowed_updates": ALLOWED_UPDATES, "drop_pending_updates": False})
+        log.info("webhook registered: %s", WEBHOOK_URL)
+        return "set"
+    except Exception as e:  # bad token etc. must not break scheduling or the stack
+        log.error("webhook registration failed: %s", e)
+        return f"error: {e}"
+
+
+def delete_slot_schedules() -> int:
+    n = 0
+    for page in scheduler.get_paginator("list_schedules").paginate(GroupName=GROUP, NamePrefix="slot-"):
+        for sch in page["Schedules"]:
+            scheduler.delete_schedule(GroupName=GROUP, Name=sch["Name"])
+            n += 1
+    return n
+
+
+def _cfn_respond(event, context, status: str, reason: str = "", data: dict | None = None) -> None:
+    body = json.dumps({
+        "Status": status, "PhysicalResourceId": "posture-bot-setup",
+        "Reason": (reason or "see CloudWatch log stream " + getattr(context, "log_stream_name", ""))[:900],
+        "StackId": event["StackId"], "RequestId": event["RequestId"],
+        "LogicalResourceId": event["LogicalResourceId"], "Data": data or {}}).encode()
+    req = urllib.request.Request(event["ResponseURL"], data=body, method="PUT",
+                                 headers={"Content-Type": "", "Content-Length": str(len(body))})
+    urllib.request.urlopen(req, timeout=30).read()
+
+
+def _cfn(event, context):
+    """Custom::PostDeploy: runs on create/update of the stack, cleans up on delete.
+    Always answers CloudFormation, or the stack would hang for an hour."""
+    try:
+        kind = event["RequestType"]
+        if kind == "Delete":
+            removed = delete_slot_schedules()
+            hook = "skipped"
+            try:
+                api("deleteWebhook")
+                hook = "deleted"
+            except Exception as e:
+                hook = f"not deleted: {e}"
+            data = {"Schedules": f"{removed} deleted", "Webhook": hook}
+        else:
+            new, old = event.get("ResourceProperties", {}), event.get("OldResourceProperties", {})
+            removed = 0
+            if kind == "Update" and str(new.get("CatchupGrace")) != str(old.get("CatchupGrace")):
+                removed = delete_slot_schedules()  # recreate with the new retry window
+            created = plan(time.time())
+            data = {"Schedules": f"{removed} recreated, {len(created)} created", "Webhook": ensure_webhook(force=True)}
+        log.info("custom resource %s: %s", kind, data)
+        _cfn_respond(event, context, "SUCCESS", f"{data}", data)
+    except Exception as e:
+        log.exception("custom resource failed")
+        _cfn_respond(event, context, "FAILED", f"{type(e).__name__}: {e}")
+
+
 def planner(event, context):
     event = event or {}
-    if event.get("set_webhook"):
-        res = api("setWebhook", {"url": event["set_webhook"], "secret_token": webhook_secret(),
-                                 "allowed_updates": ["message", "my_chat_member"],
-                                 "drop_pending_updates": False})
-        me = api("getMe")
-        log.info("webhook set for @%s", me.get("username"))
-        return {"webhook": res, "bot": me.get("username")}
+    if "RequestType" in event and "ResponseURL" in event:
+        return _cfn(event, context)
+    created = plan(time.time())
+    return {"created": created, "webhook": ensure_webhook()}
 
-    now = time.time()
+
+def plan(now: float) -> list[int]:
+    """Ensure a one-time schedule exists for each of the next LOOKAHEAD slots."""
     existing = set()
     for page in scheduler.get_paginator("list_schedules").paginate(GroupName=GROUP, NamePrefix="slot-"):
         existing |= {s["Name"] for s in page["Schedules"]}
@@ -374,7 +451,7 @@ def planner(event, context):
             if e.response["Error"]["Code"] != "ConflictException":
                 raise
     log.info("planner: created %s, existing %d", created, len(existing))
-    return {"created": created}
+    return created
 
 
 def broadcast(event, context):

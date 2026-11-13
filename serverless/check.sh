@@ -21,7 +21,7 @@ URL=$(aws cloudformation describe-stacks --region "$R" --stack-name posture-bot 
 curl -s "https://api.telegram.org/bot$TOKEN/getWebhookInfo" | python3 -c "
 import json,sys,time
 r=json.load(sys.stdin).get('result',{}); want='$URL'
-print('  \033[32m✔\033[0m webhook points at the Lambda URL' if r.get('url')==want else f'  \033[31m✘\033[0m webhook url is {r.get(\"url\")!r}, expected {want} (run ./deploy.sh)')
+print('  \033[32m✔\033[0m webhook points at the Lambda URL' if r.get('url')==want else f'  \033[31m✘\033[0m webhook url is {r.get(\"url\")!r}, expected {want} (run sam deploy, or wait for the hourly planner)')
 print(f'    pending updates: {r.get(\"pending_update_count\",0)}')
 if r.get('last_error_date'):
     print(f'  \033[31m✘\033[0m last delivery error {int(time.time()-r[\"last_error_date\"])}s ago: {r.get(\"last_error_message\")}')

@@ -17,15 +17,26 @@ sys.path.insert(0, os.path.join(HERE, "src"))
 import test_e2e as tg  # noqa: E402  fake Telegram server
 
 calls = []
+hook_state = {}
+cfn_responses = []
 
 
 class Fake(tg.H):
+    def do_PUT(self):  # CloudFormation custom-resource response URL
+        cfn_responses.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+        self.send_response(200); self.send_header("Content-Length", "0"); self.end_headers()
+
     def do_POST(self):
         method = self.path.rsplit("/", 1)[-1]
-        if method == "setWebhook":
-            p = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-            calls.append(("setWebhook", p))
-            return self.reply({"ok": True, "result": True})
+        if method in ("setWebhook", "getWebhookInfo", "deleteWebhook"):
+            n = int(self.headers.get("Content-Length") or 0)
+            p = json.loads(self.rfile.read(n) or b"{}")
+            calls.append((method, p))
+            if method == "setWebhook":
+                hook_state.clear(); hook_state.update(url=p["url"], allowed_updates=p["allowed_updates"])
+            elif method == "deleteWebhook":
+                hook_state.clear()
+            return self.reply({"ok": True, "result": dict(hook_state) if method == "getWebhookInfo" else True})
         return super().do_POST()
 
 
@@ -40,6 +51,7 @@ os.environ.update({
     "BROADCAST_ARN": "arn:aws:lambda:eu-central-1:123456789012:function:posture-bot-broadcast",
     "DLQ_ARN": "arn:aws:sqs:eu-central-1:123456789012:dlq",
     "ALLOWED_CHANNELS": "@GoodChan, -1003", "SCHEDULE_MARGIN": "2",
+    "WEBHOOK_URL": "https://example.lambda-url.on.aws/",
 })
 
 from moto import mock_aws  # noqa: E402
@@ -136,6 +148,7 @@ with mock_aws():
     from datetime import datetime, timezone
     plan_t = time.time()
     res = app.planner({}, Ctx())
+    assert res["webhook"] == "set" and hook_state["url"] == "https://example.lambda-url.on.aws/", res
     names = {s["Name"] for s in sched.list_schedules(GroupName="posture-bot")["Schedules"]}
     assert res["created"] and names == {f"slot-{s}" for s in res["created"]}, (res, names)
     assert all(app.slot_time(s) > plan_t for s in res["created"]), "scheduled a past slot"
@@ -156,8 +169,10 @@ with mock_aws():
     assert on_minute and pushed, (on_minute, pushed)
     ok(f"planner created {len(res['created'])} at() schedules: {on_minute} at slot minute, "
        f"{pushed} too-close ones pushed +SCHEDULE_MARGIN; none in the past")
-    assert app.planner({}, Ctx())["created"] == []
-    ok("planner is idempotent")
+    calls.clear()
+    r = app.planner({}, Ctx())
+    assert r == {"created": [], "webhook": "ok"} and [m for m, _ in calls] == ["getWebhookInfo"], (r, calls)
+    ok("planner is idempotent; hourly run only checks the webhook when it's already right")
 
     # --- broadcast at the exact second
     s = next(x for x in range(int(time.time() // 6), 10**12) if app.slot_time(x) > time.time() + 1.5)
@@ -227,7 +242,45 @@ with mock_aws():
     ok("/stop, bot-kicked and removed-from-channel deactivate")
     hook(update(22, 2, "/next"))
     assert tg.messages[-1][1].startswith("Next reminder:"), tg.messages[-1]
-    r = app.planner({"set_webhook": "https://example.lambda-url.on.aws/"}, Ctx())
-    assert calls[-1][1]["secret_token"] == secret and calls[-1][1]["url"].startswith("https://"), calls
-    ok("set_webhook registers URL with secret token")
+    # --- CloudFormation custom resource: plain `sam deploy` sets everything up
+    def cfn(kind, grace="4", old_grace=None):
+        ev = {"RequestType": kind, "ResponseURL": f"http://127.0.0.1:{srv.server_port}/cfn-response",
+              "StackId": "stack", "RequestId": f"req-{len(cfn_responses)}", "LogicalResourceId": "PostDeploy",
+              "ResourceProperties": {"CatchupGrace": grace}}
+        if old_grace is not None:
+            ev["OldResourceProperties"] = {"CatchupGrace": old_grace}
+        n = len(cfn_responses)
+        app.planner(ev, Ctx())
+        assert len(cfn_responses) == n + 1, "no response sent to CloudFormation"
+        return cfn_responses[-1]
+
+    for sch in sched.list_schedules(GroupName="posture-bot")["Schedules"]:
+        sched.delete_schedule(GroupName="posture-bot", Name=sch["Name"])
+    hook_state.clear(); calls.clear()
+    r = cfn("Create")
+    n_sched = len(sched.list_schedules(GroupName="posture-bot")["Schedules"])
+    assert r["Status"] == "SUCCESS" and r["PhysicalResourceId"] == "posture-bot-setup" and n_sched > 20, (r, n_sched)
+    assert r["Data"]["Webhook"] == "set" and calls[-1][0] == "setWebhook" and calls[-1][1]["secret_token"] == secret
+    ok(f"custom resource Create: SUCCESS, {n_sched} schedules, webhook set with secret")
+    r = cfn("Update", grace="4", old_grace="4")
+    assert r["Status"] == "SUCCESS" and r["Data"]["Schedules"].startswith("0 recreated"), r
+    r = cfn("Update", grace="60", old_grace="4")
+    assert r["Status"] == "SUCCESS" and r["Data"]["Schedules"].startswith(f"{n_sched} recreated"), r
+    ok("custom resource Update: re-registers webhook; recreates schedules only when CatchupGrace changes")
+    r = cfn("Delete")
+    assert r["Status"] == "SUCCESS" and not hook_state and not sched.list_schedules(GroupName="posture-bot")["Schedules"], r
+    ok("custom resource Delete: schedules removed, webhook deleted")
+    boto3.client("ssm").delete_parameter(Name="/posture-bot/token")
+    app._token = None
+    r = cfn("Create")
+    assert r["Status"] == "SUCCESS" and r["Data"]["Webhook"] == "token missing", r
+    assert app.planner({}, Ctx())["webhook"] == "token missing"
+    boto3.client("ssm").put_parameter(Name="/posture-bot/token", Value="TEST", Type="SecureString")
+    app._token = None
+    assert app.planner({}, Ctx())["webhook"] == "set" and hook_state.get("url")
+    ok("no token yet: deploy still succeeds; hourly planner registers the webhook once the token is stored")
+    app.scheduler.list_schedules = None  # force an unexpected error
+    r = cfn("Create")
+    assert r["Status"] == "FAILED" and "TypeError" in r["Reason"], r
+    ok("unexpected error is reported to CloudFormation as FAILED (stack doesn't hang)")
     print("ALL CHECKS PASSED")

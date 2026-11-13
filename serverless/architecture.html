@@ -37,6 +37,7 @@
     <marker id="ag" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#34d399"/></marker>
     <marker id="ao" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#fb923c"/></marker>
     <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#fb7185"/></marker>
+    <marker id="ay" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#fbbf24"/></marker>
     <marker id="av" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#a78bfa"/></marker>
   </defs>
   <rect width="1202" height="770" fill="url(#grid)"/>
@@ -76,6 +77,8 @@
     <path d="M960,578 L960,488" stroke="#fb923c" marker-end="url(#ao)"/>
     <!-- planner -> one-time schedules (create) -->
     <path d="M858,488 L858,530 L800,530 L800,606 L762,606" stroke="#fb923c" marker-end="url(#ao)"/>
+    <!-- CloudFormation -> planner -->
+    <path d="M1110,330 L1110,374 L1050,374 L1050,418" stroke="#fbbf24" marker-end="url(#ay)"/>
     <!-- planner <-> state -->
     <path d="M985,418 L985,330" stroke="#a78bfa" marker-start="url(#av)" marker-end="url(#av)"/>
   </g>
@@ -102,6 +105,7 @@
     <text x="966" y="530" fill="#fb923c">rate(1 hour)</text>
     <text x="806" y="560" fill="#fb923c">CreateSchedule</text>
     <text x="806" y="570" fill="#fb923c">24 h ahead</text>
+    <text x="1058" y="402" fill="#fbbf24">on deploy</text>
     <text x="991" y="372" fill="#a78bfa">seed ·</text>
     <text x="991" y="382" fill="#a78bfa">done?</text>
   </g>
@@ -187,7 +191,7 @@
   <text x="970" y="442" text-anchor="middle" fill="#e2e8f0" font-size="12" font-weight="600">λ posture-bot-planner</text>
   <text x="970" y="458" text-anchor="middle" fill="#6ee7b7" font-size="9">keeps 24 h of slots scheduled</text>
   <text x="970" y="472" text-anchor="middle" fill="#6ee7b7" font-size="8">too close? schedule now+90 s</text>
-  <text x="970" y="482" text-anchor="middle" fill="#6ee7b7" font-size="8">also: set_webhook on deploy</text>
+  <text x="970" y="482" text-anchor="middle" fill="#6ee7b7" font-size="8">+ keeps Telegram webhook registered</text>
 
   <!-- one-time schedules -->
   <rect x="540" y="580" width="220" height="70" rx="6" fill="#0f172a"/>
@@ -210,6 +214,14 @@
   <text x="405" y="604" text-anchor="middle" fill="#e2e8f0" font-size="12" font-weight="600">SQS · DLQ</text>
   <text x="405" y="620" text-anchor="middle" fill="#fda4af" font-size="9">posture-bot-dlq</text>
   <text x="405" y="634" text-anchor="middle" fill="#fda4af" font-size="8">missed slots · 14 d</text>
+
+  <!-- CloudFormation custom resource -->
+  <rect x="1050" y="250" width="120" height="78" rx="6" fill="#0f172a"/>
+  <rect x="1050" y="250" width="120" height="78" rx="6" fill="rgba(120,53,15,0.3)" stroke="#fbbf24" stroke-width="1.5"/>
+  <text x="1110" y="272" text-anchor="middle" fill="#e2e8f0" font-size="11" font-weight="600">CloudFormation</text>
+  <text x="1110" y="288" text-anchor="middle" fill="#fcd34d" font-size="9">sam deploy</text>
+  <text x="1110" y="302" text-anchor="middle" fill="#fcd34d" font-size="8">Custom::PostDeploy</text>
+  <text x="1110" y="315" text-anchor="middle" fill="#fcd34d" font-size="8">create·update·delete</text>
 
   <!-- legend -->
   <g font-size="9" fill="#94a3b8" transform="translate(30,712)">
@@ -253,7 +265,7 @@
       <li>• missed slots are dropped, never sent late</li>
       <li>• lease + per-chat sent log → no duplicates</li>
       <li>• a started round always finishes</li>
-      <li>• token cached only 5 min</li>
+      <li>• plain sam deploy sets up schedules + webhook</li>
     </ul>
   </div>
 </div>

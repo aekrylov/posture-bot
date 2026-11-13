@@ -1,0 +1,12 @@
+# `sam deploy` from this directory deploys the stack and (via the PostDeploy
+# custom resource) schedules slots and registers the Telegram webhook.
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "posture-bot"
+resolve_s3 = true
+s3_prefix = "posture-bot"
+region = "eu-central-1"
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = false
+fail_on_empty_changeset = false

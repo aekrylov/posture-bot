@@ -15,19 +15,22 @@ Telegram ──webhook──▶ function URL ──▶ webhook                  
 
 ```sh
 aws ssm put-parameter --name /posture-bot/token --type SecureString --value '<BotFather token>'
-./deploy.sh
+sam deploy
 ```
 
-`deploy.sh` does three things:
+`samconfig.toml` holds the stack name, region and capabilities, so no flags are needed. On every create or update, the `PostDeploy` custom resource runs the planner, which does two things:
 
-- deploys the stack with `sam deploy`
-- runs the planner once
-- registers the Telegram webhook, if the token parameter exists
+- schedules the next 24 hours of slots
+- registers the Telegram webhook from inside AWS, so the token never leaves it
 
-The webhook is registered by the planner Lambda itself, so the token stays inside AWS. To set options, re-run the script with `PARAMS`, for example:
+Deleting the stack (`sam delete`) removes the schedules and the webhook.
+
+If the token isn't stored yet, the deploy still succeeds. The hourly planner registers the webhook within an hour of the token appearing. It also re-registers it if the URL changes, or if the token is rotated and Telegram starts getting 403s.
+
+Options are stack parameters. SAM keeps a parameter's previous value until you override it:
 
 ```sh
-PARAMS="Caption='Выпрями спину' CatchupGrace=300" ./deploy.sh
+sam deploy --parameter-overrides "Caption='Выпрями спину' CatchupGrace=300"
 ```
 
 ## Posting to a channel
@@ -43,7 +46,7 @@ To unsubscribe the channel, remove the bot or take away its "Post messages" righ
 By default, any channel that makes the bot an admin gets subscribed. To limit it to your own channels:
 
 ```sh
-PARAMS="AllowedChannels=@mychannel,-1001234567890" ./deploy.sh
+sam deploy --parameter-overrides "AllowedChannels=@mychannel,-1001234567890"
 ```
 
 ## Outage handling
@@ -51,7 +54,7 @@ PARAMS="AllowedChannels=@mychannel,-1001234567890" ./deploy.sh
 - **Schedules exist well ahead.** One-time schedules are created 24 hours in advance, so the planner can fail for a day without any slot being missed. AWS invokes each one itself, retrying for up to `CatchupGrace` seconds (default 120). After that the event goes to the `posture-bot-dlq` SQS queue.
 - **No late spam.** A slot that can't start within `CatchupGrace` of its time is dropped, never sent late, and the planner never re-sends past slots. A round that has started always finishes, however long it takes.
 - **Too-close slots are pushed out.** If a slot is too close to schedule at its own minute (only right after the first deploy), its schedule is set 90 s from now instead. Lateness is then measured from that new time.
-- **Broadcast is idempotent.** It keeps a per-(slot, chat) delivery log, holds a per-slot lease, and writes a done marker when finished. Scheduler retries and Lambda async retries therefore never cause duplicates.
+- **Broadcast is idempotent.** It keeps a per-(slot, chat) delivery log, holds a per-slot lease, and writes a done marker when finished. Retries resend only to chats without a recorded delivery. The one gap: a crash or timeout between Telegram accepting a photo and the delivery being recorded resends to that one chat.
 - **Slot times are fixed.** Each hour's second is `HMAC(seed, slot) mod 3600`, and the seed is stored in DynamoDB.
 - **Long broadcasts continue.** A broadcast that runs low on Lambda time hands off to a fresh invocation. One invocation sends to about 20k users at 25 msg/s.
 - **New users get a photo immediately.** `/start` sends one right away; it doesn't count as an hourly slot.
