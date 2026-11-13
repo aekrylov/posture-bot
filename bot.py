@@ -6,7 +6,7 @@ Stdlib only (Python 3.9+). Config via environment:
   BOT_TOKEN       required
   PHOTO_PATH      default ./photo.jpg
   DB_PATH         default ./bot.sqlite3
-  CATCHUP_GRACE   seconds a missed slot may still be delivered late (default 1800)
+  CATCHUP_GRACE   max seconds a slot may start late (default 120); later = dropped
   SEND_RATE       max messages/second during a broadcast (default 25; TG cap ~30)
   CAPTION         optional caption
   API_BASE        default https://api.telegram.org (override for tests)
@@ -19,8 +19,9 @@ Outage tolerance therefore comes from:
     seed persisted, so restarts never re-roll the second or skip/duplicate;
   * a persisted per-(slot, chat) delivery log, so a crash mid-broadcast resumes
     exactly where it stopped;
-  * catch-up: a slot missed while the bot/host was down (or the Mac asleep) is
-    still delivered if we're back within CATCHUP_GRACE; older ones are dropped;
+  * no late spam: a slot missed while the bot/host was down (or the Mac asleep)
+    is only delivered if we're back within CATCHUP_GRACE (2 min); older ones
+    are dropped and the next hour goes out as usual;
   * wall-clock polling (never one long sleep), so host sleep/wake is handled;
   * launchd/systemd KeepAlive to restart the process (see deploy/).
 """
@@ -48,7 +49,7 @@ TOKEN = os.environ.get("BOT_TOKEN", "")
 API_BASE = os.environ.get("API_BASE", "https://api.telegram.org").rstrip("/")
 PHOTO_PATH = os.environ.get("PHOTO_PATH", os.path.join(HERE, "photo.jpg"))
 DB_PATH = os.environ.get("DB_PATH", os.path.join(HERE, "bot.sqlite3"))
-GRACE = int(os.environ.get("CATCHUP_GRACE", "1800"))
+GRACE = int(os.environ.get("CATCHUP_GRACE", "120"))
 SEND_RATE = float(os.environ.get("SEND_RATE", "25"))
 CAPTION = os.environ.get("CAPTION", "")
 PERIOD = int(os.environ.get("PERIOD", "3600"))
@@ -147,7 +148,7 @@ def slot_time(slot: int) -> int:
 
 
 def due_slots(now: float) -> list[int]:
-    """Slots whose time has passed but are still within the catch-up window."""
+    """Slots whose time has passed less than GRACE ago (later ones are dropped)."""
     first = int((now - GRACE) // PERIOD)
     return [s for s in range(first, int(now // PERIOD) + 1) if now - GRACE <= slot_time(s) <= now]
 
@@ -197,8 +198,10 @@ def broadcast(slot: int) -> None:
         " (SELECT 1 FROM sent s WHERE s.slot=? AND s.chat_id=u.chat_id)", (t, slot))]
     if pending:
         log.info("slot %d (%s): sending to %d users", slot, fmt(t), len(pending))
+    # due_slots() only starts a slot within GRACE of its time; once started, the
+    # round finishes even if it takes longer than GRACE
     for chat_id in pending:
-        if stop_event.is_set() or time.time() - t > GRACE:
+        if stop_event.is_set():
             break
         for attempt in range(5):
             try:

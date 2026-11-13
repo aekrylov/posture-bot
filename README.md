@@ -37,7 +37,7 @@ Telegram's server-side scheduled messages aren't available to bots. The Bot API 
 
 - **Deterministic slots.** Each hour's send second is `HMAC(seed, hour) mod 3600`, and the seed is stored in SQLite. A restart therefore never re-rolls the time, skips a slot, or sends a slot twice.
 - **Delivery log.** Every successful send is recorded per (slot, chat). A broadcast interrupted by a crash resumes with the users who haven't received it yet.
-- **Catch-up window.** If the bot is down or the host is asleep when a slot fires, that slot is still delivered on recovery, as long as recovery happens within `CATCHUP_GRACE` (default 30 min). Slots older than that are dropped instead of being sent in a burst.
+- **No late spam.** If the bot is down or the host is asleep when a slot fires, the slot is only delivered if the bot is back within `CATCHUP_GRACE` (default 2 min). Anything later is dropped, and the next hour goes out as usual.
 - **Wall-clock checks.** The scheduler re-checks the clock at least every 30 s and never sleeps for an hour at a time, so it notices system sleep and wake.
 - **Supervisor.** launchd or systemd restarts the process. A file lock prevents two instances from running against the same database.
 - **Rate limits.** Sends are throttled to 25 msg/s, and `retry_after` from a 429 response is honoured. The photo is uploaded once, then sent by `file_id`.

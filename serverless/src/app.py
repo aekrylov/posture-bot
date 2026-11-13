@@ -6,8 +6,9 @@ Three handlers share this module:
              the photo right away, /stop unsubscribes, /next shows the next send.
   planner    Runs hourly (EventBridge Scheduler, rate(1 hour)). Makes sure a
              one-time EventBridge schedule exists for each of the next LOOKAHEAD
-             hourly slots, and invokes broadcast directly for a slot that is
-             due (or overdue but within CATCHUP_GRACE) and not yet delivered.
+             hourly slots. A slot too close to schedule at its own minute (only
+             right after first deploy) is scheduled SCHEDULE_MARGIN s from now
+             instead. Past slots are never re-sent.
              Also handles {"set_webhook": url} so the token never leaves AWS.
   broadcast  Invoked by a one-time schedule at the minute of the slot; sleeps to
              the exact random second, then sends the photo to every active user.
@@ -17,8 +18,10 @@ Outage tolerance:
   * Schedules are created LOOKAHEAD hours ahead, so the planner can be down for a
     day without missing anything; AWS fires them on its own, retrying for up to
     CATCHUP_GRACE seconds and dead-lettering to SQS after that.
+  * No late spam: a slot that can't *start* within CATCHUP_GRACE of its time is
+    dropped, never sent late; the next hour goes out as usual.
   * Per-(slot, chat) delivery log + a per-slot lease make broadcast idempotent
-    under Scheduler retries, Lambda async retries and planner catch-up.
+    under Scheduler retries and Lambda async retries.
   * A broadcast that runs low on Lambda time re-invokes itself and resumes.
 """
 from __future__ import annotations
@@ -51,7 +54,8 @@ STATE_TABLE = E["STATE_TABLE"]
 TOKEN_PARAM = E.get("TOKEN_PARAM", "/posture-bot/token")
 API_BASE = E.get("API_BASE", "https://api.telegram.org").rstrip("/")
 PERIOD = int(E.get("PERIOD", "3600"))
-GRACE = int(E.get("CATCHUP_GRACE", "1800"))
+GRACE = int(E.get("CATCHUP_GRACE", "120"))  # max lateness at which a slot still starts
+SCHEDULE_MARGIN = int(E.get("SCHEDULE_MARGIN", "90"))  # never create a schedule closer than this
 SEND_RATE = float(E.get("SEND_RATE", "25"))
 CAPTION = E.get("CAPTION", "")
 LOOKAHEAD = int(E.get("LOOKAHEAD", "24"))
@@ -324,8 +328,9 @@ def webhook(event, context):
     return {"statusCode": 200, "body": "ok"}
 
 
-def _invoke_broadcast(slot: int) -> None:
-    lambda_.invoke(FunctionName=BROADCAST_ARN, InvocationType="Event", Payload=json.dumps({"slot": slot}).encode())
+def _invoke_continuation(slot: int) -> None:
+    lambda_.invoke(FunctionName=BROADCAST_ARN, InvocationType="Event",
+                   Payload=json.dumps({"slot": slot, "continuation": True}).encode())
 
 
 def planner(event, context):
@@ -342,44 +347,43 @@ def planner(event, context):
     existing = set()
     for page in scheduler.get_paginator("list_schedules").paginate(GroupName=GROUP, NamePrefix="slot-"):
         existing |= {s["Name"] for s in page["Schedules"]}
-    created, caught_up = [], []
-    for s in range(int((now - GRACE) // PERIOD), int(now // PERIOD) + LOOKAHEAD + 1):
+    created = []
+    for s in range(int(now // PERIOD), int(now // PERIOD) + LOOKAHEAD + 1):
         name, t = f"slot-{s}", slot_time(s)
-        fire = t - t % 60  # Scheduler works at minute granularity; broadcast sleeps the rest
-        if name in existing or t < now - GRACE:
+        if name in existing or t <= now:  # past slots are never re-sent
             continue
-        if fire > now + 90:
-            try:
-                scheduler.create_schedule(
-                    Name=name, GroupName=GROUP,
-                    ScheduleExpression=f"at({datetime.fromtimestamp(fire, timezone.utc):%Y-%m-%dT%H:%M:%S})",
-                    ScheduleExpressionTimezone="UTC",
-                    FlexibleTimeWindow={"Mode": "OFF"},
-                    ActionAfterCompletion="DELETE",
-                    Target={"Arn": BROADCAST_ARN, "RoleArn": SCHEDULER_ROLE_ARN,
-                            "Input": json.dumps({"slot": s}),
-                            "RetryPolicy": {"MaximumEventAgeInSeconds": max(60, min(GRACE, DAY)),
-                                            "MaximumRetryAttempts": 185},
-                            **({"DeadLetterConfig": {"Arn": DLQ_ARN}} if DLQ_ARN else {})},
-                    Description=f"posture-bot slot at {datetime.fromtimestamp(t, timezone.utc):%Y-%m-%dT%H:%M:%SZ}")
-                created.append(s)
-            except ClientError as e:
-                if e.response["Error"]["Code"] != "ConflictException":
-                    raise
-        elif not is_done(s):
-            # too close to schedule, or its schedule already fired/was lost:
-            # run it directly; broadcast is idempotent and lease-protected
-            _invoke_broadcast(s)
-            caught_up.append(s)
-    log.info("planner: created %s, invoked %s, existing %d", created, caught_up, len(existing))
-    return {"created": created, "invoked": caught_up}
+        # fire at the slot's minute (Scheduler is minute-granular; broadcast sleeps the
+        # rest). If that's too close (first deploy), push it SCHEDULE_MARGIN s out;
+        # broadcast then starts late by at most ~SCHEDULE_MARGIN, judged against "at".
+        fire = max(t - t % 60, math.ceil(now) + SCHEDULE_MARGIN)
+        try:
+            scheduler.create_schedule(
+                Name=name, GroupName=GROUP,
+                ScheduleExpression=f"at({datetime.fromtimestamp(fire, timezone.utc):%Y-%m-%dT%H:%M:%S})",
+                ScheduleExpressionTimezone="UTC",
+                FlexibleTimeWindow={"Mode": "OFF"},
+                ActionAfterCompletion="DELETE",
+                Target={"Arn": BROADCAST_ARN, "RoleArn": SCHEDULER_ROLE_ARN,
+                        "Input": json.dumps({"slot": s, "at": fire}),
+                        "RetryPolicy": {"MaximumEventAgeInSeconds": max(60, min(GRACE, DAY)),
+                                        "MaximumRetryAttempts": 185},
+                        **({"DeadLetterConfig": {"Arn": DLQ_ARN}} if DLQ_ARN else {})},
+                Description=f"posture-bot slot at {datetime.fromtimestamp(t, timezone.utc):%Y-%m-%dT%H:%M:%SZ}")
+            created.append(s)
+        except ClientError as e:
+            if e.response["Error"]["Code"] != "ConflictException":
+                raise
+    log.info("planner: created %s, existing %d", created, len(existing))
+    return {"created": created}
 
 
 def broadcast(event, context):
     slot = int(event["slot"])
     t = slot_time(slot)
-    if time.time() - t > GRACE:
-        log.warning("slot %d is %ds late (> grace %ds); skipping", slot, time.time() - t, GRACE)
+    due = max(t, int(event.get("at", t)))  # "at" > t only for slots pushed out by the planner
+    late = time.time() - due
+    if late > GRACE and not event.get("continuation"):
+        log.warning("slot %d would start %ds late (> grace %ds); dropping", slot, late, GRACE)
         return {"skipped": "stale"}
     if is_done(slot):
         return {"skipped": "done"}
@@ -405,7 +409,7 @@ def broadcast(event, context):
     finally:
         state.delete_item(Key={"pk": "lock", "sk": str(slot)})
     if result.get("continued"):
-        _invoke_broadcast(slot)  # only after releasing the lease, so the continuation can take it
+        _invoke_continuation(slot)  # only after releasing the lease, so the continuation can take it
     return result
 
 
@@ -433,10 +437,7 @@ def _broadcast_locked(slot: int, t: int, context):
     log.info("slot %d (%s): %d to send, %d already delivered", slot, fmt(t), len(pending), len(delivered))
 
     sent = failed = 0
-    for chat_id in pending:
-        if time.time() - t > GRACE:
-            log.warning("slot %d: grace expired with %d unsent", slot, len(pending) - sent - failed)
-            break
+    for chat_id in pending:  # once started, a round always finishes (grace only gates the start)
         if context.get_remaining_time_in_millis() < 30_000:
             log.info("slot %d: low on time after %d sends; continuing in a new invocation", slot, sent)
             return {"sent": sent, "failed": failed, "continued": True}

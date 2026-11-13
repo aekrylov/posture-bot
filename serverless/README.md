@@ -27,7 +27,7 @@ aws ssm put-parameter --name /posture-bot/token --type SecureString --value '<Bo
 The webhook is registered by the planner Lambda itself, so the token stays inside AWS. To set options, re-run the script with `PARAMS`, for example:
 
 ```sh
-PARAMS="Caption='Выпрями спину' CatchupGrace=1800" ./deploy.sh
+PARAMS="Caption='Выпрями спину' CatchupGrace=300" ./deploy.sh
 ```
 
 ## Posting to a channel
@@ -48,9 +48,10 @@ PARAMS="AllowedChannels=@mychannel,-1001234567890" ./deploy.sh
 
 ## Outage handling
 
-- **Schedules exist well ahead.** One-time schedules are created 24 hours in advance, so the planner can fail for a day without any slot being missed. AWS invokes each one itself, retrying for up to `CatchupGrace` seconds. After that the event goes to the `posture-bot-dlq` SQS queue.
-- **Planner catches up.** If a slot is overdue but still within grace and hasn't been delivered, for example because its schedule was lost or fired while Lambda was failing, the hourly planner invokes broadcast directly.
-- **Broadcast is idempotent.** It keeps a per-(slot, chat) delivery log, holds a per-slot lease, and writes a done marker when finished. Scheduler retries, Lambda async retries and planner catch-ups therefore never cause duplicates.
+- **Schedules exist well ahead.** One-time schedules are created 24 hours in advance, so the planner can fail for a day without any slot being missed. AWS invokes each one itself, retrying for up to `CatchupGrace` seconds (default 120). After that the event goes to the `posture-bot-dlq` SQS queue.
+- **No late spam.** A slot that can't start within `CatchupGrace` of its time is dropped, never sent late, and the planner never re-sends past slots. A round that has started always finishes, however long it takes.
+- **Too-close slots are pushed out.** If a slot is too close to schedule at its own minute (only right after the first deploy), its schedule is set 90 s from now instead. Lateness is then measured from that new time.
+- **Broadcast is idempotent.** It keeps a per-(slot, chat) delivery log, holds a per-slot lease, and writes a done marker when finished. Scheduler retries and Lambda async retries therefore never cause duplicates.
 - **Slot times are fixed.** Each hour's second is `HMAC(seed, slot) mod 3600`, and the seed is stored in DynamoDB.
 - **Long broadcasts continue.** A broadcast that runs low on Lambda time hands off to a fresh invocation. One invocation sends to about 20k users at 25 msg/s.
 - **New users get a photo immediately.** `/start` sends one right away; it doesn't count as an hourly slot.

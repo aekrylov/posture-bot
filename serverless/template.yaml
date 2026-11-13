@@ -9,10 +9,10 @@ Parameters:
     Description: SSM SecureString parameter holding the BotFather token
   CatchupGrace:
     Type: Number
-    Default: 1800
+    Default: 120
     MinValue: 60
-    MaxValue: 86400
-    Description: Seconds a missed slot may still be delivered late
+    MaxValue: 3600
+    Description: Max seconds a slot may start late (AWS retries); later slots are dropped, never sent late
   SendRate:
     Type: Number
     Default: 25
@@ -187,9 +187,6 @@ Resources:
             - Effect: Allow
               Action: ssm:GetParameter
               Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${TokenParam}
-            - Effect: Allow
-              Action: lambda:InvokeFunction
-              Resource: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:posture-bot-broadcast
             - Effect: Allow
               Action: scheduler:ListSchedules
               Resource: "*"

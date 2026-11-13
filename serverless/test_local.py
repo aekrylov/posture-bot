@@ -39,7 +39,7 @@ os.environ.update({
     "SCHEDULER_ROLE_ARN": "arn:aws:iam::123456789012:role/sched",
     "BROADCAST_ARN": "arn:aws:lambda:eu-central-1:123456789012:function:posture-bot-broadcast",
     "DLQ_ARN": "arn:aws:sqs:eu-central-1:123456789012:dlq",
-    "ALLOWED_CHANNELS": "@GoodChan, -1003",
+    "ALLOWED_CHANNELS": "@GoodChan, -1003", "SCHEDULE_MARGIN": "2",
 })
 
 from moto import mock_aws  # noqa: E402
@@ -133,17 +133,29 @@ with mock_aws():
     ok("allowlist by numeric id works; revoking post rights unsubscribes")
 
     # --- planner creates one-time schedules
+    from datetime import datetime, timezone
+    plan_t = time.time()
     res = app.planner({}, Ctx())
     names = {s["Name"] for s in sched.list_schedules(GroupName="posture-bot")["Schedules"]}
     assert res["created"] and names == {f"slot-{s}" for s in res["created"]}, (res, names)
-    s0 = res["created"][0]
-    d = sched.get_schedule(GroupName="posture-bot", Name=f"slot-{s0}")
-    t = app.slot_time(s0)
-    from datetime import datetime, timezone
-    assert d["ScheduleExpression"] == f"at({datetime.fromtimestamp(t - t % 60, timezone.utc):%Y-%m-%dT%H:%M:%S})"
-    assert json.loads(d["Target"]["Input"]) == {"slot": s0} and d["ActionAfterCompletion"] == "DELETE"
-    assert d["Target"]["RetryPolicy"]["MaximumEventAgeInSeconds"] == 60  # GRACE clamped to >= 60
-    ok(f"planner created {len(res['created'])} at() schedules (minute-floored), invoked {res['invoked']}")
+    assert all(app.slot_time(s) > plan_t for s in res["created"]), "scheduled a past slot"
+    on_minute = pushed = 0
+    for s0 in res["created"]:
+        d = sched.get_schedule(GroupName="posture-bot", Name=f"slot-{s0}")
+        t = app.slot_time(s0)
+        inp = json.loads(d["Target"]["Input"])
+        at_ = inp["at"]
+        assert inp["slot"] == s0 and d["ActionAfterCompletion"] == "DELETE"
+        assert d["ScheduleExpression"] == f"at({datetime.fromtimestamp(at_, timezone.utc):%Y-%m-%dT%H:%M:%S})"
+        assert d["Target"]["RetryPolicy"]["MaximumEventAgeInSeconds"] == 60  # GRACE clamped to >= 60
+        if at_ == t - t % 60:
+            on_minute += 1
+        else:  # too close for its own minute: pushed SCHEDULE_MARGIN out, never earlier
+            assert t - t % 60 < at_ <= plan_t + 2 + 1, (s0, t, at_, plan_t)
+            pushed += 1
+    assert on_minute and pushed, (on_minute, pushed)
+    ok(f"planner created {len(res['created'])} at() schedules: {on_minute} at slot minute, "
+       f"{pushed} too-close ones pushed +SCHEDULE_MARGIN; none in the past")
     assert app.planner({}, Ctx())["created"] == []
     ok("planner is idempotent")
 
@@ -174,7 +186,7 @@ with mock_aws():
     r1 = app.broadcast({"slot": s2}, Ctx([900_000, 900_000, 900_000, 10_000]))
     assert r1.get("continued") and r1["sent"] == 1 and invoked == [s2], (r1, invoked)
     assert "Item" not in app.state.get_item(Key={"pk": "lock", "sk": str(s2)})
-    r2 = app.broadcast({"slot": s2}, Ctx())
+    r2 = app.broadcast({"slot": s2, "continuation": True}, Ctx())
     assert r2 == {"sent": 2, "failed": 0}, r2
     assert all(len(photos_to(c, before)) == 1 for c in (1, 2, -1001))
     ok("low-time continuation resumes without duplicates")
@@ -183,7 +195,7 @@ with mock_aws():
     assert app.broadcast({"slot": s - 3}, Ctx()) == {"skipped": "stale"}
     ok("slot older than grace skipped")
 
-    # --- planner catch-up for a missed slot (schedule lost, not done)
+    # --- missed slot (schedule lost) is never re-sent or re-scheduled by the planner
     s3 = s2 + 1
     time.sleep(max(0, app.slot_time(s3) - time.time()) + 0.5)
     try:
@@ -191,8 +203,19 @@ with mock_aws():
     except Exception:
         pass
     invoked.clear()
-    assert s3 in app.planner({}, Ctx())["invoked"] and s3 in invoked
-    ok("planner invokes overdue undelivered slot within grace")
+    r = app.planner({}, Ctx())
+    assert s3 not in r["created"] and not invoked, (r, invoked)
+    ok("planner never re-sends or re-schedules a missed slot")
+
+    # --- pushed slot: lateness is judged against its scheduled "at", not the slot second
+    s4 = s3 + 1
+    t4 = app.slot_time(s4)
+    time.sleep(max(0, t4 + 5 - time.time()))  # 5 s after slot time; GRACE = 4
+    assert app.broadcast({"slot": s4}, Ctx()) == {"skipped": "stale"}
+    n1 = len(photos_to(1, t4))
+    r = app.broadcast({"slot": s4, "at": t4 + 3}, Ctx())
+    assert r.get("sent", 0) >= 1 and len(photos_to(1, t4)) == n1 + 1, r
+    ok("slot 5 s late: dropped without 'at', sent when it was pushed to at=t+3 (2 s late)")
 
     # --- /stop, kicked, /next, set_webhook
     hook(update(20, 2, "/stop"))

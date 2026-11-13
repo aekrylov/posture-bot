@@ -76,8 +76,6 @@
     <path d="M960,578 L960,488" stroke="#fb923c" marker-end="url(#ao)"/>
     <!-- planner -> one-time schedules (create) -->
     <path d="M858,488 L858,530 L800,530 L800,606 L762,606" stroke="#fb923c" marker-end="url(#ao)"/>
-    <!-- planner -> broadcast (catch-up invoke) -->
-    <path d="M858,440 L762,440" stroke="#94a3b8" stroke-dasharray="5,4" marker-end="url(#a)"/>
     <!-- planner <-> state -->
     <path d="M985,418 L985,330" stroke="#a78bfa" marker-start="url(#av)" marker-end="url(#av)"/>
   </g>
@@ -99,12 +97,11 @@
     <text x="790" y="398" fill="#a78bfa">· done marker</text>
     <text x="300" y="440" fill="#34d399">sendPhoto (file_id) · 25 msg/s</text>
     <text x="656" y="530" fill="#fb923c">fires at slot's minute</text>
-    <text x="656" y="540" fill="#fb923c">retries ≤ 30 min</text>
+    <text x="656" y="540" fill="#fb923c">retries ≤ 2 min</text>
     <text x="493" y="634" fill="#fb7185">gave up</text>
     <text x="966" y="530" fill="#fb923c">rate(1 hour)</text>
     <text x="806" y="560" fill="#fb923c">CreateSchedule</text>
     <text x="806" y="570" fill="#fb923c">24 h ahead</text>
-    <text x="768" y="432">catch-up</text>
     <text x="991" y="372" fill="#a78bfa">seed ·</text>
     <text x="991" y="382" fill="#a78bfa">done?</text>
   </g>
@@ -189,7 +186,7 @@
   <rect x="860" y="420" width="220" height="68" rx="6" fill="rgba(6,78,59,0.4)" stroke="#34d399" stroke-width="1.5"/>
   <text x="970" y="442" text-anchor="middle" fill="#e2e8f0" font-size="12" font-weight="600">λ posture-bot-planner</text>
   <text x="970" y="458" text-anchor="middle" fill="#6ee7b7" font-size="9">keeps 24 h of slots scheduled</text>
-  <text x="970" y="472" text-anchor="middle" fill="#6ee7b7" font-size="8">invokes overdue slots ≤ 30 min</text>
+  <text x="970" y="472" text-anchor="middle" fill="#6ee7b7" font-size="8">too close? schedule now+90 s</text>
   <text x="970" y="482" text-anchor="middle" fill="#6ee7b7" font-size="8">also: set_webhook on deploy</text>
 
   <!-- one-time schedules -->
@@ -223,7 +220,6 @@
     <rect x="345" y="0" width="14" height="12" rx="3" fill="rgba(136,19,55,0.4)" stroke="#fb7185"/><text x="365" y="10">Security / failure</text>
     <rect x="485" y="0" width="14" height="12" rx="3" fill="rgba(30,41,59,0.5)" stroke="#94a3b8"/><text x="505" y="10">External</text>
     <line x1="580" y1="6" x2="610" y2="6" stroke="#34d399" stroke-width="1.4" marker-end="url(#ag)"/><text x="618" y="10">outbound to Telegram</text>
-    <line x1="755" y1="6" x2="785" y2="6" stroke="#94a3b8" stroke-width="1.4" stroke-dasharray="5,4" marker-end="url(#a)"/><text x="793" y="10">fallback path</text>
   </g>
   <text x="30" y="752" font-size="8" fill="#475569">~$1/month per 1000 subscribers · Telegram's ~30 msg/s cap is the scale limit (≈90k recipients per hourly round)</text>
 </svg>
@@ -253,10 +249,10 @@
   <div class="card">
     <div class="card-header"><div class="card-dot rose"></div><h3>Failure handling</h3></div>
     <ul>
-      <li>• Scheduler retries up to 30 min, then DLQ</li>
-      <li>• planner re-invokes overdue undelivered slots</li>
+      <li>• Scheduler retries up to 2 min, then DLQ</li>
+      <li>• missed slots are dropped, never sent late</li>
       <li>• lease + per-chat sent log → no duplicates</li>
-      <li>• stale slots (&gt; 30 min) are skipped</li>
+      <li>• a started round always finishes</li>
       <li>• token cached only 5 min</li>
     </ul>
   </div>
