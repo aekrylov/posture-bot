@@ -22,6 +22,10 @@ Parameters:
   DisplayTz:
     Type: String
     Default: Europe/Berlin
+  AllowedChannels:
+    Type: String
+    Default: ""
+    Description: Comma-separated @usernames / -100 ids of channels allowed to subscribe (empty = any)
 
 Globals:
   Function:
@@ -40,6 +44,7 @@ Globals:
         SEND_RATE: !Ref SendRate
         CAPTION: !Ref Caption
         DISPLAY_TZ: !Ref DisplayTz
+        ALLOWED_CHANNELS: !Ref AllowedChannels
         SCHEDULE_GROUP: !Ref ScheduleGroup
         SCHEDULER_ROLE_ARN: !GetAtt SchedulerRole.Arn
         BROADCAST_ARN: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:posture-bot-broadcast

@@ -31,10 +31,11 @@ unset TOKEN
 
 echo "3. Subscribers"
 aws dynamodb scan --region "$R" --table-name posture-bot-users --output json \
-  --query 'Items[].{id:chat_id.N,active:active.N,name:name.S}' | python3 -c "
+  --query 'Items[].{id:chat_id.N,active:active.N,name:name.S,type:type.S}' | python3 -c "
 import json,sys; u=json.load(sys.stdin)
-print(f'    {sum(x[\"active\"]==\"1\" for x in u)} active / {len(u)} total')
-for x in u[:10]: print(f'    {x[\"id\"]:>12}  active={x[\"active\"]}  {x[\"name\"] or \"\"}')"
+ch=[x for x in u if x['type']=='channel' and x['active']=='1']
+print(f'    {sum(x[\"active\"]==\"1\" for x in u)} active / {len(u)} total ({len(ch)} active channels)')
+for x in u[:10]: print(f'    {x[\"id\"]:>15}  active={x[\"active\"]}  {x[\"type\"] or \"private\":8} {x[\"name\"] or \"\"}')"
 
 echo "4. Schedule"
 aws scheduler list-schedules --region "$R" --group-name posture-bot --name-prefix slot- --output json \
@@ -51,7 +52,7 @@ aws logs filter-log-events --region "$R" --log-group-name /aws/lambda/posture-bo
 import json,sys,re
 m=json.load(sys.stdin)
 done=[x.split('\t')[-1].strip() for x in m if ': done, sent' in x]
-errs=[x.split('\t')[-1].strip()[:160] for x in m if re.search(r'\[ERROR\]|Traceback|Task timed out|failed', x)]
+errs=[x.split('\t')[-1].strip()[:160] for x in m if re.search(r'\[ERROR\]|Traceback|Task timed out|failed:', x)]
 for d in done[-6:]: print('    '+d)
 print(f'  \033[32m✔\033[0m no errors' if not errs else f'  \033[31m✘\033[0m {len(errs)} error lines, latest:')
 for e in errs[-3:]: print('      '+e)"

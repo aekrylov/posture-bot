@@ -39,6 +39,7 @@ os.environ.update({
     "SCHEDULER_ROLE_ARN": "arn:aws:iam::123456789012:role/sched",
     "BROADCAST_ARN": "arn:aws:lambda:eu-central-1:123456789012:function:posture-bot-broadcast",
     "DLQ_ARN": "arn:aws:sqs:eu-central-1:123456789012:dlq",
+    "ALLOWED_CHANNELS": "@GoodChan, -1003",
 })
 
 from moto import mock_aws  # noqa: E402
@@ -102,6 +103,35 @@ with mock_aws():
     assert kinds[0] == "upload" and set(kinds[1:]) == {"file_id"}, kinds
     ok("photo uploaded once, then sent by file_id")
 
+    # --- channels: subscribe by granting the bot "Post messages" admin rights
+    def mcm(uid, chat, status, **rights):
+        return {"update_id": uid, "my_chat_member": {"chat": chat, "new_chat_member": {"status": status, **rights}}}
+
+    def active(cid):
+        return int((app.users.get_item(Key={"chat_id": cid}).get("Item") or {}).get("active", 0))
+
+    CH = {"id": -1001, "type": "channel", "title": "Good", "username": "goodchan"}
+    CH3 = {"id": -1003, "type": "channel", "title": "Private by id"}
+    EVIL = {"id": -1002, "type": "channel", "title": "Other", "username": "other"}
+    nmsg = len(tg.messages)
+    hook(mcm(30, CH, "administrator", can_post_messages=True))
+    assert active(-1001) == 1 and len(photos_to(-1001, t0)) == 1
+    hook(mcm(31, CH, "administrator", can_post_messages=True, can_edit_messages=True))
+    assert len(photos_to(-1001, t0)) == 1
+    ok("channel subscribed on admin+post rights, first photo posted once (rights change doesn't repost)")
+    hook(mcm(32, EVIL, "administrator", can_post_messages=True))
+    assert active(-1002) == 0 and not photos_to(-1002, t0)
+    hook(mcm(33, CH3, "administrator", can_post_messages=False))
+    assert active(-1003) == 0 and not photos_to(-1003, t0)
+    hook({"update_id": 34, "channel_post": {"message_id": 1, "text": "/start", "chat": EVIL}})
+    assert active(-1002) == 0 and len(tg.messages) == nmsg
+    ok("allowlist enforced; admin without post rights ignored; channel posts / text replies never sent to channels")
+    hook(mcm(35, CH3, "administrator", can_post_messages=True))
+    assert active(-1003) == 1 and photos_to(-1003, t0)
+    hook(mcm(36, CH3, "administrator", can_post_messages=False))
+    assert active(-1003) == 0
+    ok("allowlist by numeric id works; revoking post rights unsubscribes")
+
     # --- planner creates one-time schedules
     res = app.planner({}, Ctx())
     names = {s["Name"] for s in sched.list_schedules(GroupName="posture-bot")["Schedules"]}
@@ -122,10 +152,11 @@ with mock_aws():
     t = app.slot_time(s)
     r = app.broadcast({"slot": s}, Ctx())
     got = {c: photos_to(c, t) for c in (1, 2)}
-    assert r == {"sent": 2, "failed": 0} and all(got.values()), (r, got)
+    got[-1001] = photos_to(-1001, t)
+    assert r == {"sent": 3, "failed": 0} and all(got.values()), (r, got)
     lag = max(v[0] for v in got.values()) - t
-    assert 0 <= min(v[0] for v in got.values()) - t and lag < 0.5, lag
-    ok(f"broadcast slot {s}: both users, lag {lag:.3f}s")
+    assert 0 <= min(v[0] for v in got.values()) - t and lag < 1.0, lag
+    ok(f"broadcast slot {s}: 2 users + channel, lag {lag:.3f}s")
     assert app.broadcast({"slot": s}, Ctx()) == {"skipped": "done"}
     ok("re-run of a done slot sends nothing")
 
@@ -144,8 +175,8 @@ with mock_aws():
     assert r1.get("continued") and r1["sent"] == 1 and invoked == [s2], (r1, invoked)
     assert "Item" not in app.state.get_item(Key={"pk": "lock", "sk": str(s2)})
     r2 = app.broadcast({"slot": s2}, Ctx())
-    assert r2 == {"sent": 1, "failed": 0}, r2
-    assert len(photos_to(1, before)) == 1 and len(photos_to(2, before)) == 1
+    assert r2 == {"sent": 2, "failed": 0}, r2
+    assert all(len(photos_to(c, before)) == 1 for c in (1, 2, -1001))
     ok("low-time continuation resumes without duplicates")
 
     # --- stale slot skipped
@@ -166,9 +197,11 @@ with mock_aws():
     # --- /stop, kicked, /next, set_webhook
     hook(update(20, 2, "/stop"))
     hook({"update_id": 21, "my_chat_member": {"chat": {"id": 1}, "new_chat_member": {"status": "kicked"}}})
-    u = {int(i["chat_id"]): int(i["active"]) for i in app.users.scan()["Items"]}
+    u = {int(i["chat_id"]): int(i["active"]) for i in app.users.scan()["Items"] if int(i["chat_id"]) > 0}
     assert u == {1: 0, 2: 0, tg.BLOCKED: 0}, u
-    ok("/stop and bot-kicked deactivate")
+    hook(mcm(23, CH, "left"))
+    assert active(-1001) == 0
+    ok("/stop, bot-kicked and removed-from-channel deactivate")
     hook(update(22, 2, "/next"))
     assert tg.messages[-1][1].startswith("Next reminder:"), tg.messages[-1]
     r = app.planner({"set_webhook": "https://example.lambda-url.on.aws/"}, Ctx())

@@ -30,6 +30,22 @@ The webhook is registered by the planner Lambda itself, so the token stays insid
 PARAMS="Caption='Выпрями спину' CatchupGrace=1800" ./deploy.sh
 ```
 
+## Posting to a channel
+
+1. Create the channel, public or private.
+2. Open **Channel → Administrators → Add admin** and pick the bot.
+3. Leave **Post messages** enabled. No other rights are needed.
+
+The bot subscribes the channel as soon as it gets admin rights and posts the first photo straight away. It then posts every hour, the same as for private chats.
+
+To unsubscribe the channel, remove the bot or take away its "Post messages" right. Text commands are never posted to a channel.
+
+By default, any channel that makes the bot an admin gets subscribed. To limit it to your own channels:
+
+```sh
+PARAMS="AllowedChannels=@mychannel,-1001234567890" ./deploy.sh
+```
+
 ## Outage handling
 
 - **Schedules exist well ahead.** One-time schedules are created 24 hours in advance, so the planner can fail for a day without any slot being missed. AWS invokes each one itself, retrying for up to `CatchupGrace` seconds. After that the event goes to the `posture-bot-dlq` SQS queue.

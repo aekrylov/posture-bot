@@ -60,6 +60,9 @@ SCHEDULER_ROLE_ARN = E.get("SCHEDULER_ROLE_ARN", "")
 BROADCAST_ARN = E.get("BROADCAST_ARN", "")
 DLQ_ARN = E.get("DLQ_ARN", "")
 DISPLAY_TZ = ZoneInfo(E.get("DISPLAY_TZ", "Europe/Berlin"))
+# Channels the bot may post to once made admin: comma-separated @usernames and/or
+# numeric ids (-100...). Empty = any channel that grants "Post messages".
+ALLOWED_CHANNELS = {c.strip().lower() for c in E.get("ALLOWED_CHANNELS", "").split(",") if c.strip()}
 PHOTO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "photo.jpg")
 DAY = 86400
 
@@ -230,21 +233,59 @@ def set_active(chat_id: int, active: bool) -> None:
                       ExpressionAttributeValues={":a": int(active)})
 
 
+def subscribe(chat: dict) -> None:
+    users.put_item(Item={"chat_id": chat["id"], "active": 1, "subscribed_at": math.ceil(time.time()),
+                         "type": chat.get("type", ""),
+                         "name": chat.get("title") or chat.get("username") or chat.get("first_name") or ""})
+
+
+def channel_allowed(chat: dict) -> bool:
+    if not ALLOWED_CHANNELS:
+        return True
+    ids = {str(chat["id"])}
+    if chat.get("username"):
+        ids.add("@" + chat["username"].lower())
+    return bool(ids & ALLOWED_CHANNELS)
+
+
+def handle_channel_membership(chat: dict, member: dict) -> None:
+    """Channels subscribe by making the bot an admin with "Post messages"."""
+    cid = chat["id"]
+    can_post = member["status"] == "creator" or (
+        member["status"] == "administrator" and member.get("can_post_messages", False))
+    if not can_post:
+        set_active(cid, False)
+        log.info("channel %s (%s): can't post, deactivated", cid, chat.get("title"))
+        return
+    if not channel_allowed(chat):
+        log.warning("channel %s (@%s) not in ALLOWED_CHANNELS; ignoring", cid, chat.get("username"))
+        set_active(cid, False)
+        return
+    prev = users.get_item(Key={"chat_id": cid}).get("Item")
+    if prev and int(prev.get("active", 0)):
+        return  # e.g. other admin rights changed; already subscribed
+    subscribe(chat)
+    log.info("channel %s (%s) subscribed", cid, chat.get("title"))
+    send_with_retry(cid)  # first post right away, like /start
+
+
 def handle_update(upd: dict) -> None:
     mcm = upd.get("my_chat_member")
     if mcm:
-        if mcm["new_chat_member"]["status"] in ("kicked", "left"):
+        member = mcm["new_chat_member"]
+        if member["status"] in ("kicked", "left"):
             set_active(mcm["chat"]["id"], False)
+        elif mcm["chat"]["type"] == "channel":
+            handle_channel_membership(mcm["chat"], member)
         return
-    msg = upd.get("message") or upd.get("channel_post")
+    msg = upd.get("message")  # channel posts are ignored: channels subscribe via admin rights
     if not msg or "text" not in msg:
         return
     cmd = msg["text"].split()[0].split("@")[0].lower()
     chat = msg["chat"]
     cid = chat["id"]
     if cmd == "/start":
-        users.put_item(Item={"chat_id": cid, "active": 1, "subscribed_at": math.ceil(time.time()),
-                             "name": chat.get("title") or chat.get("username") or chat.get("first_name") or ""})
+        subscribe(chat)
         reply(cid, "Subscribed: one reminder every hour at a random second.\n"
                    f"Next one: {fmt(next_slot_time(time.time()))}\n/stop to unsubscribe.")
         send_with_retry(cid)  # first one right away; not counted as an hourly slot
@@ -291,7 +332,7 @@ def planner(event, context):
     event = event or {}
     if event.get("set_webhook"):
         res = api("setWebhook", {"url": event["set_webhook"], "secret_token": webhook_secret(),
-                                 "allowed_updates": ["message", "channel_post", "my_chat_member"],
+                                 "allowed_updates": ["message", "my_chat_member"],
                                  "drop_pending_updates": False})
         me = api("getMe")
         log.info("webhook set for @%s", me.get("username"))
