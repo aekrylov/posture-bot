@@ -134,6 +134,16 @@ def _multipart(fields: dict, files: dict) -> tuple[bytes, str]:
 
 
 def api(token: str, method: str, params: dict | None = None, files: dict | None = None, timeout: float = 30):
+    try:
+        return _api(token, method, params, files, timeout)
+    except ApiError as e:  # setWebhook etc. are rate limited per bot (~1/s): wait it out once
+        if method == "sendPhoto" or not e.retry_after or e.retry_after > 10:
+            raise
+        time.sleep(e.retry_after + 0.5)
+        return _api(token, method, params, files, timeout)
+
+
+def _api(token: str, method: str, params: dict | None, files: dict | None, timeout: float):
     params = {k: v for k, v in (params or {}).items() if v is not None}
     if files:
         body, ctype = _multipart({k: (json.dumps(v) if isinstance(v, (dict, list)) else v)
@@ -696,15 +706,23 @@ def handle_admin(tok: str, msg: dict) -> None:
 
 
 # ---------------------------------------------------------------- sync
-def ensure_webhook(token: str, url: str, secret: str, force: bool = False) -> str:
-    """Point a bot's webhook at url. Never raises: returns ok / set / error: ..."""
+def fingerprint(secret: str, url: str) -> str:
+    return hashlib.sha256(f"{url}|{secret}|{','.join(ALLOWED_UPDATES)}".encode()).hexdigest()[:16]
+
+
+def ensure_webhook(token: str, url: str, secret: str, force: bool = False, registered: str | None = None) -> str:
+    """Point a bot's webhook at url. Never raises: returns ok / set / error: ...
+    `registered` is the fingerprint of what we last registered for this bot. A new
+    token means a new secret, hence a new fingerprint, so rotation re-registers
+    without needing force; concurrent syncs of an unchanged bot don't call setWebhook."""
     if not url:
         return "no webhook URL"
     try:
         if not force:
             info = api(token, "getWebhookInfo")
             if (info.get("url") == url and sorted(info.get("allowed_updates") or []) == sorted(ALLOWED_UPDATES)
-                    and "403" not in (info.get("last_error_message") or "")):  # 403 = stale secret
+                    and "403" not in (info.get("last_error_message") or "")  # 403 = stale secret
+                    and registered in (None, fingerprint(secret, url))):
                 return "ok"
         api(token, "setWebhook", {"url": url, "secret_token": secret, "allowed_updates": ALLOWED_UPDATES,
                                   "drop_pending_updates": False})
@@ -727,7 +745,7 @@ def set_commands(token: str, admins: set[int]) -> None:
             pass  # admin hasn't started the bot yet
 
 
-def sync_bot(u: str, force: bool = False) -> str:
+def sync_bot(u: str, force: bool = False, commands: bool = False) -> str:
     """Validate a bot's token, make sure its webhook is ours, record status in DynamoDB."""
     u = norm(u)
     b = bot_secrets(force=True).get(u)
@@ -745,11 +763,14 @@ def sync_bot(u: str, force: bool = False) -> str:
         status = f"token belongs to @{me['username']}, not @{u}"
         update_settings(u, status=status, checked_at=now)
         return status
-    hook = ensure_webhook(b["token"], WEBHOOK_URL, webhook_secret(b["token"]), force)
-    if force or hook == "set":
+    secret = webhook_secret(b["token"])
+    fp = fingerprint(secret, WEBHOOK_URL)
+    hook = ensure_webhook(b["token"], WEBHOOK_URL, secret, force, settings(u).get("hook_fp", fp))
+    if force or hook == "set" or commands:
         set_commands(b["token"], b["admins"] | ({super_admin()} - {None}))
     status = "ok" if hook in ("ok", "set") else hook
-    update_settings(u, status=status, checked_at=now, bot_id=me["id"], display_name=me.get("first_name", ""))
+    extra = {"hook_fp": fp} if hook in ("ok", "set") else {}
+    update_settings(u, status=status, checked_at=now, bot_id=me["id"], display_name=me.get("first_name", ""), **extra)
     log.info("@%s synced: %s (webhook %s)", u, status, hook)
     return status
 
@@ -767,12 +788,17 @@ def ensure_admin_bot(force: bool = False) -> str:
     tok = admin_token(force=True)
     if not tok:
         return "admin token missing"
-    hook = ensure_webhook(tok, ADMIN_WEBHOOK_URL, admin_secret(tok), force)
+    secret = admin_secret(tok)
+    fp = fingerprint(secret, ADMIN_WEBHOOK_URL)
+    prev = (state.get_item(Key={"pk": "meta", "sk": "admin-hook"}).get("Item") or {}).get("fp", fp)
+    hook = ensure_webhook(tok, ADMIN_WEBHOOK_URL, secret, force, prev)
     if force or hook == "set":
         try:
             api(tok, "setMyCommands", {"commands": SUPER_COMMANDS})
         except Exception as e:
             log.warning("admin setMyCommands failed: %s", e)
+    if hook in ("ok", "set"):
+        state.put_item(Item={"pk": "meta", "sk": "admin-hook", "fp": fp})
     return "ok" if hook in ("ok", "set") else hook
 
 
@@ -780,14 +806,14 @@ def on_ssm_change(detail: dict) -> dict:
     name, op = detail.get("name", ""), detail.get("operation", "")
     log.info("SSM %s %s", op, name)
     if name == ADMIN_TOKEN_PARAM:
-        return {"admin": ensure_admin_bot(force=True)}
+        return {"admin": ensure_admin_bot()}
     if name == SUPER_ADMIN_PARAM:
         super_admin(force=True)
         return {"super_admin": "reloaded"}
     if name.startswith(BOTS_PATH + "/"):
         parts = name[len(BOTS_PATH) + 1:].split("/")
         if len(parts) == 2:
-            return {parts[0]: sync_bot(parts[0], force=True)}
+            return {parts[0]: sync_bot(parts[0], commands=(parts[1] == "admins"))}
     return {}
 
 

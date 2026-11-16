@@ -24,6 +24,7 @@ calls = []        # (token, method, params)
 photos = []       # (token, chat_id, time, kind, file_id)
 hooks = {}        # bot username -> webhook info (one per bot, like Telegram)
 deleted_msgs = []
+last_set = {}
 fid_n = [0]
 
 
@@ -68,6 +69,11 @@ class TG(BaseHTTPRequestHandler):
             return self.reply({"ok": True, "result": {"id": hash(token) % 10**6, "username": TOKENS[token],
                                                       "first_name": TOKENS[token]}})
         if method == "setWebhook":
+            u = TOKENS[token]
+            if time.time() - last_set.get(u, 0) < 1:  # Telegram: ~1 setWebhook per second per bot
+                return self.reply({"ok": False, "error_code": 429, "description": "Too Many Requests: retry after 1",
+                                   "parameters": {"retry_after": 1}}, 429)
+            last_set[u] = time.time()
             hooks[TOKENS[token]] = {"url": p["url"], "allowed_updates": p["allowed_updates"], "secret": p["secret_token"]}
             return self.reply({"ok": True, "result": True})
         if method == "getWebhookInfo":
@@ -235,9 +241,16 @@ with mock_aws():
     assert texts("ADMIN", SUPER)[-1] == "@Bot_Two added. Status: ok", texts("ADMIN", SUPER)[-1]
     assert app.param("/pb/bots/bot_two/token") == "T2" and app.param("/pb/bots/bot_two/admins") == str(SUPER)
     assert hooks["Bot_Two"]["url"] == "https://bots.example/"
+    # the SSM events /addbot itself triggers arrive right away: they must not re-register or clobber status
+    n_set = sum(1 for t, m, _ in calls if t == "T2" and m == "setWebhook")
+    assert app.on_ssm_change({"name": "/pb/bots/bot_two/token", "operation": "Create"}) == {"bot_two": "ok"}
+    assert app.on_ssm_change({"name": "/pb/bots/bot_two/admins", "operation": "Create"}) == {"bot_two": "ok"}
+    assert sum(1 for t, m, _ in calls if t == "T2" and m == "setWebhook") == n_set == 1
+    assert app.settings("bot_two")["status"] == "ok"
     ahook(msg(SUPER, "/addbot T2"))
     assert "already exists" in texts("ADMIN", SUPER)[-1]
-    ok("/addbot: rejects bad token, adds bot (SSM token+admins, webhook), refuses duplicate, deletes token msgs")
+    ok("/addbot: rejects bad token, adds bot (SSM token+admins, webhook) with one setWebhook despite the SSM "
+       "event burst, refuses duplicate, deletes token msgs")
 
     # /admins add ALICE to bot_two
     ahook(msg(SUPER, "/admins bot_two add 2000"))
@@ -317,6 +330,10 @@ with mock_aws():
     ahook(msg(SUPER, "/settoken T1NEW"))
     assert app.param("/pb/bots/bot_one/token") == "T1NEW" and hooks["bot_one"]["url"] == "https://bots.example/"
     assert hook("T1NEW", msg(11, "/next"))["statusCode"] == 200 and texts("T1NEW", 11)
+    sp("/pb/bots/bot_one/token", "T1")  # rotated in the console: SSM event alone must re-register the secret
+    assert app.on_ssm_change({"name": "/pb/bots/bot_one/token", "operation": "Update"}) == {"bot_one": "ok"}
+    assert hooks["bot_one"]["secret"] == app.webhook_secret("T1"), "rotated token's secret not registered"
+    assert hook("T1", msg(11, "/next"))["statusCode"] == 200 and hook("T1NEW", msg(11, "/next"))["statusCode"] == 403
     sp("/pb/bots/bot_three/token", "T2")  # console typo: bot_two's token under bot_three
     r = app.planner({"source": "aws.ssm", "detail": {"name": "/pb/bots/bot_three/token", "operation": "Create"}}, Ctx())
     assert r == {"bot_three": "token belongs to @Bot_Two, not @bot_three"}, r
@@ -326,7 +343,7 @@ with mock_aws():
     assert r["bot_three"].startswith("invalid token"), r
     sp("/pb/bots/bot_three/token", "T3")
     assert app.on_ssm_change({"name": "/pb/bots/bot_three/token", "operation": "Update"}) == {"bot_three": "ok"}
-    ok("/settoken rotates (new secret works); console mistakes show up as status in DynamoDB; fixing them syncs")
+    ok("/settoken and console rotation re-register the new secret (old one rejected); console mistakes show up as status in DynamoDB; fixing them syncs")
 
     # ---- 9. /removebot with confirmation
     ahook(msg(SUPER, "/removebot bot_three"))
