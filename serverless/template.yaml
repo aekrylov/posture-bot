@@ -1,12 +1,12 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
-Description: posture-bot - hourly photo at a random second (Lambda + EventBridge Scheduler + DynamoDB)
+Description: posture-bot - hourly photo at a random second from any number of Telegram bots (Lambda + EventBridge Scheduler + DynamoDB + SSM)
 
 Parameters:
-  TokenParam:
+  SsmPrefix:
     Type: String
-    Default: /posture-bot/token
-    Description: SSM SecureString parameter holding the BotFather token
+    Default: /posture-bot
+    Description: SSM path holding bots/<username>/{token,admins}, admin-token and super-admin
   CatchupGrace:
     Type: Number
     Default: 120
@@ -16,16 +16,9 @@ Parameters:
   SendRate:
     Type: Number
     Default: 25
-  Caption:
-    Type: String
-    Default: ""
   DisplayTz:
     Type: String
     Default: Europe/Berlin
-  AllowedChannels:
-    Type: String
-    Default: ""
-    Description: Comma-separated @usernames / -100 ids of channels allowed to subscribe (empty = any)
 
 Globals:
   Function:
@@ -37,14 +30,13 @@ Globals:
       LogGroup: !Ref LogGroup
     Environment:
       Variables:
-        USERS_TABLE: !Ref UsersTable
+        BOTS_TABLE: !Ref BotsTable
+        SUBS_TABLE: !Ref SubsTable
         STATE_TABLE: !Ref StateTable
-        TOKEN_PARAM: !Ref TokenParam
+        SSM_PREFIX: !Ref SsmPrefix
         CATCHUP_GRACE: !Ref CatchupGrace
         SEND_RATE: !Ref SendRate
-        CAPTION: !Ref Caption
         DISPLAY_TZ: !Ref DisplayTz
-        ALLOWED_CHANNELS: !Ref AllowedChannels
         SCHEDULE_GROUP: !Ref ScheduleGroup
         SCHEDULER_ROLE_ARN: !GetAtt SchedulerRole.Arn
         BROADCAST_ARN: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:posture-bot-broadcast
@@ -57,8 +49,41 @@ Resources:
       LogGroupName: /aws/lambda/posture-bot
       RetentionInDays: 14
 
+  # Per-bot settings and status. Edit enabled / caption / allowed_channels here.
+  BotsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: posture-bot-bots
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: username
+          AttributeType: S
+      KeySchema:
+        - AttributeName: username
+          KeyType: HASH
+
+  SubsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: posture-bot-subs
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: bot
+          AttributeType: S
+        - AttributeName: chat_id
+          AttributeType: N
+      KeySchema:
+        - AttributeName: bot
+          KeyType: HASH
+        - AttributeName: chat_id
+          KeyType: RANGE
+
+  # Single-bot era subscribers; copied into SubsTable by the PostDeploy migration.
+  # Retained (not deleted) if removed from the template later.
   UsersTable:
     Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       TableName: posture-bot-users
       BillingMode: PAY_PER_REQUEST
@@ -125,23 +150,53 @@ Resources:
                 Action: sqs:SendMessage
                 Resource: !GetAtt DeadLetterQueue.Arn
 
+  # Shared webhook for all bots; the bot is identified by its secret header.
   WebhookFunction:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: posture-bot-webhook
       Handler: app.webhook
-      Timeout: 30
+      Timeout: 60
       FunctionUrlConfig:
         AuthType: NONE
       Policies:
         - DynamoDBCrudPolicy:
-            TableName: !Ref UsersTable
+            TableName: !Ref BotsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SubsTable
         - DynamoDBCrudPolicy:
             TableName: !Ref StateTable
         - Statement:
             - Effect: Allow
-              Action: ssm:GetParameter
-              Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${TokenParam}
+              Action: ["ssm:GetParameter", "ssm:GetParametersByPath"]
+              Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SsmPrefix}/*
+
+  # Super-admin bot: its own URL and secret; answers only the super admin.
+  AdminFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: posture-bot-admin
+      Handler: app.admin_webhook
+      Timeout: 60
+      FunctionUrlConfig:
+        AuthType: NONE
+      Environment:
+        Variables:
+          WEBHOOK_URL: !GetAtt WebhookFunctionUrl.FunctionUrl
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref BotsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SubsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref StateTable
+        - Statement:
+            - Effect: Allow
+              Action: ["ssm:GetParameter", "ssm:GetParametersByPath"]
+              Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SsmPrefix}/*
+            - Effect: Allow
+              Action: ["ssm:PutParameter", "ssm:DeleteParameter", "ssm:DeleteParameters"]
+              Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SsmPrefix}/bots/*
 
   BroadcastFunction:
     Type: AWS::Serverless::Function
@@ -154,13 +209,15 @@ Resources:
         MaximumEventAgeInSeconds: !Ref CatchupGrace
       Policies:
         - DynamoDBCrudPolicy:
-            TableName: !Ref UsersTable
+            TableName: !Ref BotsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SubsTable
         - DynamoDBCrudPolicy:
             TableName: !Ref StateTable
         - Statement:
             - Effect: Allow
-              Action: ssm:GetParameter
-              Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${TokenParam}
+              Action: ["ssm:GetParameter", "ssm:GetParametersByPath"]
+              Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SsmPrefix}/*
             - Effect: Allow
               Action: lambda:InvokeFunction
               Resource: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:posture-bot-broadcast
@@ -170,10 +227,12 @@ Resources:
     Properties:
       FunctionName: posture-bot-planner
       Handler: app.planner
-      Timeout: 120
+      Timeout: 300
       Environment:
         Variables:
           WEBHOOK_URL: !GetAtt WebhookFunctionUrl.FunctionUrl
+          ADMIN_WEBHOOK_URL: !GetAtt AdminFunctionUrl.FunctionUrl
+          LEGACY_USERS_TABLE: !Ref UsersTable
       Events:
         Hourly:
           Type: ScheduleV2
@@ -183,13 +242,32 @@ Resources:
             RetryPolicy:
               MaximumRetryAttempts: 5
               MaximumEventAgeInSeconds: 3000
+        # Adding/changing/deleting a token or admin list in SSM syncs that bot within seconds
+        SsmChange:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source: ["aws.ssm"]
+              detail-type: ["Parameter Store Change"]
+              detail:
+                name:
+                  - prefix: !Sub "${SsmPrefix}/"
       Policies:
         - DynamoDBCrudPolicy:
+            TableName: !Ref BotsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SubsTable
+        - DynamoDBCrudPolicy:
             TableName: !Ref StateTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref UsersTable
         - Statement:
             - Effect: Allow
-              Action: ssm:GetParameter
-              Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${TokenParam}
+              Action: ["ssm:GetParameter", "ssm:GetParametersByPath"]
+              Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SsmPrefix}/*
+            - Effect: Allow
+              Action: ssm:PutParameter
+              Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SsmPrefix}/bots/*
             - Effect: Allow
               Action: scheduler:ListSchedules
               Resource: "*"
@@ -203,23 +281,30 @@ Resources:
               Action: iam:PassRole
               Resource: !GetAtt SchedulerRole.Arn
 
-  # Runs the planner on every create/update (schedules slots, registers the
-  # Telegram webhook) and removes the webhook on stack delete, so a plain
-  # `sam deploy` sets everything up.
+  # Runs the planner on every create/update (legacy migration, slot schedules,
+  # webhooks for every bot and the admin bot) and removes webhooks on stack
+  # delete, so a plain `sam deploy` sets everything up.
   PostDeploy:
     Type: Custom::PostDeploy
     DependsOn: BroadcastFunction
     Properties:
       ServiceToken: !GetAtt PlannerFunction.Arn
       WebhookUrl: !GetAtt WebhookFunctionUrl.FunctionUrl
+      AdminWebhookUrl: !GetAtt AdminFunctionUrl.FunctionUrl
       CatchupGrace: !Ref CatchupGrace
-      SetupVersion: "1"
+      SetupVersion: "2"
 
 Outputs:
   WebhookUrl:
     Value: !GetAtt WebhookFunctionUrl.FunctionUrl
+  AdminWebhookUrl:
+    Value: !GetAtt AdminFunctionUrl.FunctionUrl
   DeadLetterQueueUrl:
     Value: !Ref DeadLetterQueue
   Setup:
-    Description: Result of the post-deploy setup (schedules + webhook)
+    Description: Result of the post-deploy setup per bot
     Value: !GetAtt PostDeploy.Webhook
+  Migration:
+    Value: !GetAtt PostDeploy.Migration
+  AdminBot:
+    Value: !GetAtt PostDeploy.AdminBot
