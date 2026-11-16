@@ -25,6 +25,7 @@ photos = []       # (token, chat_id, time, kind, file_id)
 hooks = {}        # bot username -> webhook info (one per bot, like Telegram)
 deleted_msgs = []
 last_set = {}
+not_member = {}   # chat_id -> number of sends that fail with "not a member"
 fid_n = [0]
 
 
@@ -91,6 +92,10 @@ class TG(BaseHTTPRequestHandler):
             return self.reply({"ok": True, "result": True})
         if method == "sendPhoto":
             cid = int(p["chat_id"])
+            if cid in not_member and not_member[cid] > 0:  # freshly promoted channel, Telegram not caught up
+                not_member[cid] -= 1
+                return self.reply({"ok": False, "error_code": 403,
+                                   "description": "Forbidden: bot is not a member of the channel chat"}, 403)
             if cid == BLOCKED:
                 photos.append((token, cid, time.time(), "blocked", None))
                 return self.reply({"ok": False, "error_code": 403, "description": "Forbidden: bot was blocked"}, 403)
@@ -366,7 +371,17 @@ with mock_aws():
     hook("T2", {"update_id": 9001, "my_chat_member": {"chat": ch, "new_chat_member": {
         "status": "administrator", "can_post_messages": True}}})
     assert subs_of("bot_two")[-2002] == 1 and pics("T2", -2002) and -2002 not in subs_of("bot_one")
-    ok("/bots lists status + image; /test sends via that bot; /stats for bot admins; channels subscribe per bot")
+    not_member[-2003] = 2  # first two sends right after promotion fail
+    ch3 = {"id": -2003, "type": "channel", "title": "C3"}
+    hook("T2", {"update_id": 9002, "my_chat_member": {"chat": ch3, "new_chat_member": {
+        "status": "administrator", "can_post_messages": True}}})
+    assert subs_of("bot_two")[-2003] == 1 and len(pics("T2", -2003)) == 1, (subs_of("bot_two"), pics("T2", -2003))
+    not_member[-2003] = 1  # a send error during a broadcast never deactivates a channel
+    assert app.send_with_retry(app.get_bot("bot_two"), -2003) is False and subs_of("bot_two")[-2003] == 1
+    hook("T2", {"update_id": 9003, "my_chat_member": {"chat": ch3, "new_chat_member": {"status": "left"}}})
+    assert subs_of("bot_two")[-2003] == 0
+    ok("/bots lists status + image; /test sends via that bot; /stats for bot admins; channels subscribe per bot; "
+       "first channel post retried while Telegram reports 'not a member'; only membership updates deactivate channels")
 
     # ---- 11. hourly planner keeps webhooks; stale secret (403) re-registered
     hooks.pop("Bot_Two")

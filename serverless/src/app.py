@@ -351,9 +351,12 @@ def send_photo(bot: Bot, chat_id: int, caption: str | None = None) -> None:
     s.update(default_file_id=fid, default_sha=sha)
 
 
-def send_with_retry(bot: Bot, chat_id: int) -> bool:
-    """True if delivered. Deactivates chats that blocked the bot."""
-    for attempt in range(4):
+def send_with_retry(bot: Bot, chat_id: int, not_member_retries: int = 0) -> bool:
+    """True if delivered. Deactivates private chats that blocked the bot.
+    Channels are never deactivated from a send error: Telegram briefly answers
+    "bot is not a member" right after promoting a bot, and removal always arrives
+    as a my_chat_member update anyway."""
+    for attempt in range(4 + not_member_retries):
         try:
             send_photo(bot, chat_id)
             return True
@@ -362,9 +365,17 @@ def send_with_retry(bot: Bot, chat_id: int) -> bool:
                 log.warning("@%s rate limited; sleeping %ss", bot.username, e.retry_after)
                 time.sleep(e.retry_after + 1)
                 continue
-            if e.gone:
+            if e.gone and chat_id < 0 and not_member_retries > 0:
+                not_member_retries -= 1
+                log.info("@%s: channel %s not ready (%s); retrying", bot.username, chat_id, e.desc)
+                time.sleep(3)
+                continue
+            if e.gone and chat_id > 0:
                 log.info("@%s: deactivating %s: %s", bot.username, chat_id, e.desc)
                 set_active(bot, chat_id, False)
+            elif e.gone:
+                log.warning("@%s: channel %s: %s (kept; removal comes as a membership update)",
+                            bot.username, chat_id, e.desc)
             else:
                 log.error("@%s: send to %s failed: %s", bot.username, chat_id, e)
             return False
@@ -442,7 +453,7 @@ def handle_channel_membership(bot: Bot, chat: dict, member: dict) -> None:
     subscribe(bot, chat)
     log.info("@%s: channel %s (%s) subscribed", bot.username, cid, chat.get("title"))
     if bot.enabled:
-        send_with_retry(bot, cid)
+        send_with_retry(bot, cid, not_member_retries=4)  # ~12 s for Telegram to catch up
 
 
 def stats(bot: Bot) -> dict:
