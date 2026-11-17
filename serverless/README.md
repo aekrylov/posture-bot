@@ -1,5 +1,7 @@
 # posture-bot: serverless, multi-bot
 
+For setup and usage, see the [root README](../README.md). This file covers the design.
+
 Lambda, EventBridge Scheduler, DynamoDB and SSM. Any number of Telegram bots do the same thing: once an hour, each sends its own image to its subscribers, all at the same random second. A separate super-admin bot manages them.
 
 ```
